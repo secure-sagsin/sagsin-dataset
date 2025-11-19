@@ -19,7 +19,7 @@ from shapely.prepared import prep
 from svgpath2mpl import parse_path
 from svgpathtools import svg2paths
 
-from ssir import basestations as bs
+from sagsin import basestations as bs
 
 PROJECT_ROOT = SysPath(__file__).resolve().parents[1]
 ASSETS_DIR = PROJECT_ROOT / "assets"

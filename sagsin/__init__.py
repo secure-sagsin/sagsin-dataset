@@ -6,4 +6,4 @@ __version__ = "0.1.0"
 
 __all__ = ["basestations", "environment"]
 
-from ssir import basestations, environment
+from sagsin import basestations, environment
