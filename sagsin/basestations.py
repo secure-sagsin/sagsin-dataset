@@ -1,0 +1,1045 @@
+#!/usr/bin/env python3
+import json
+import math
+import os
+import pickle
+from abc import ABC
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, List, Optional
+
+import numpy as np
+from numpy.typing import NDArray
+
+
+@dataclass
+class EnvironmentalVariables:
+    noise_power_density: float = -174
+    SPSC_probability: float = 0.9999
+    maritime_basestations_altitude: float = 0.0
+    ground_basestations_altitude: float = 0.25
+    haps_basestations_altitude: float = 22
+    leo_basestations_altitude: float = 500
+
+
+environmental_variables = EnvironmentalVariables()
+
+
+def dB_to_linear(dB: float) -> float:
+    return 10 ** (dB / 10)
+
+
+def linear_to_dB(linear: float) -> float:
+    return 10 * np.log10(linear)
+
+
+def geo_distances(pos1: np.ndarray, pos2s: np.ndarray) -> np.ndarray:
+    """
+    Compute vectorized Haversine + altitude distance between one position and multiple others.
+
+    pos1: shape (3,) - [lat, lon, alt]
+    pos2s: shape (N, 3) - array of [lat, lon, alt]
+    return: shape (N,) - array of distances
+    """
+    lat1, lon1, alt1 = np.radians(pos1[0]), np.radians(pos1[1]), pos1[2]
+    lat2 = np.radians(pos2s[:, 0])
+    lon2 = np.radians(pos2s[:, 1])
+    alt2 = pos2s[:, 2]
+
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * (np.sin(dlon / 2) ** 2)
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+
+    R = 6371.01  # km
+    horizontal_distance = R * c
+    altitude_difference = alt2 - alt1
+
+    return np.sqrt(horizontal_distance**2 + altitude_difference**2)
+
+
+@dataclass
+class BaseStationConfig:
+    power_capacity: float  # in dBm
+    minimum_transit_power_ratio: float  # dimensionless
+    carrier_frequency: float  # in GHz
+    bandwidth: float  # in MHz
+    transmit_antenna_gain: float  # in dBi
+    receive_antenna_gain: float  # in dBi
+    antenna_gain_to_noise_temperature: float  # in dB
+    pathloss_exponent: float  # dimensionless
+    eavesdropper_density: float  # in m^-2
+    maximum_link_distance: float  # in km
+
+
+class BaseStationType(Enum):
+    MARITIME = BaseStationConfig(
+        power_capacity=30,  # in dBm
+        minimum_transit_power_ratio=0.8,  # dimensionless
+        carrier_frequency=14,  # in GHz
+        bandwidth=250,  # in MHz
+        transmit_antenna_gain=25,  # in dBi
+        receive_antenna_gain=25,  # in dBi
+        antenna_gain_to_noise_temperature=1.5,  # in dB
+        pathloss_exponent=2.7,  # dimensionless
+        eavesdropper_density=1e-3,  # in km^-2
+        maximum_link_distance=150,  # in km
+    )
+    GROUND = BaseStationConfig(
+        power_capacity=30,  # in dBm
+        minimum_transit_power_ratio=0.8,  # dimensionless
+        carrier_frequency=14,  # in GHz
+        bandwidth=250,  # in MHz
+        transmit_antenna_gain=25,  # in dBi
+        receive_antenna_gain=25,  # in dBi
+        antenna_gain_to_noise_temperature=1.5,  # in dB
+        pathloss_exponent=2.8,  # dimensionless
+        eavesdropper_density=2e-3,  # in km^-2
+        maximum_link_distance=150,  # in km
+    )
+    HAPS = BaseStationConfig(
+        power_capacity=30,  # in dBm
+        minimum_transit_power_ratio=0.8,  # dimensionless
+        carrier_frequency=14,  # in GHz
+        bandwidth=250,  # in MHz
+        transmit_antenna_gain=25,  # in dBi
+        receive_antenna_gain=25,  # in dBi
+        antenna_gain_to_noise_temperature=1.5,  # in dB
+        pathloss_exponent=2.6,  # dimensionless
+        eavesdropper_density=3e-4,  # in km^-2
+        maximum_link_distance=500,  # in km
+    )
+    LEO = BaseStationConfig(
+        power_capacity=21.5,  # in dBm
+        minimum_transit_power_ratio=0.8,  # dimensionless
+        carrier_frequency=20,  # in GHz
+        bandwidth=400,  # in MHz
+        transmit_antenna_gain=38.5,  # in dBi
+        receive_antenna_gain=38.5,  # in dBi
+        antenna_gain_to_noise_temperature=13,  # in dB
+        pathloss_exponent=2.4,  # dimensionless
+        eavesdropper_density=1e-4,  # in km^-2
+        maximum_link_distance=900,  # in km
+    )
+
+    @property
+    def config(self) -> BaseStationConfig:
+        """Returns the configuration for the base station type."""
+        return self.value
+
+    def __repr__(self):
+        return f"BaseStationType({self.name})"
+
+    @classmethod
+    def _missing_(cls, value):
+        # When deserialized BaseStationConfig does not match any enum due to minor differences
+        if not isinstance(value, BaseStationConfig):
+            raise ValueError(f"Cannot create {cls} from {value}")
+
+        for member in cls:
+            member_cfg = member.value
+            if (
+                member_cfg.power_capacity == value.power_capacity
+                and member_cfg.minimum_transit_power_ratio
+                == value.minimum_transit_power_ratio
+                and member_cfg.carrier_frequency == value.carrier_frequency
+                and member_cfg.bandwidth == value.bandwidth
+                and member_cfg.transmit_antenna_gain == value.transmit_antenna_gain
+                and member_cfg.receive_antenna_gain == value.receive_antenna_gain
+                and member_cfg.antenna_gain_to_noise_temperature
+                == value.antenna_gain_to_noise_temperature
+                and member_cfg.pathloss_exponent == value.pathloss_exponent
+                and member_cfg.maximum_link_distance == value.maximum_link_distance
+            ):
+                # Use the current enum definition without modifying it
+                return member
+
+        raise ValueError(f"No matching BaseStationType found for {value}")
+
+
+class AbstractNode(ABC):
+    """An abstract node class."""
+
+    def __init__(self, node_id: int, position: NDArray, isGeographic: bool = True):
+        self._node_id = node_id
+        self._position = position
+        self._parent: list[AbstractNode] = []
+        self._children: list[AbstractNode] = []
+        self._isGeographic = isGeographic
+
+    def get_position(self) -> NDArray:
+        return self._position
+
+    def get_distance(self, node: "AbstractNode"):
+        """
+        Calculate the distance between this node and another node.
+
+        Returns:
+            Distance in kilometers if _isGeographic is True,
+            otherwise in local metric units.
+        """
+        if self._isGeographic:
+            lon1, lat1, alt1 = self.get_position()
+            lon2, lat2, alt2 = node.get_position()
+
+            # Convert latitude and longitude from degrees to radians
+            lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+
+            # Haversine formula for great-circle distance
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            a = (
+                math.sin(dlat / 2) ** 2
+                + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+            )
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+            # Horizontal distance on the Earth's surface
+            R = 6371.01  # Earth's radius in kilometers
+            horizontal_distance = R * c
+
+            # Vertical distance (altitude difference)
+            altitude_difference = alt2 - alt1
+
+            # 3D distance calculation using Pythagoras' theorem
+            return math.sqrt(horizontal_distance**2 + altitude_difference**2)
+        else:
+            # Use Euclidean distance for local metric systems
+            return float(np.linalg.norm(self.get_position() - node.get_position()))
+
+    def get_id(self) -> int:
+        return self._node_id
+
+    def get_parent(self) -> list["AbstractNode"]:
+        return self._parent
+
+    def get_children(self) -> list["AbstractNode"]:
+        return list(self._children)
+
+    def has_children(self) -> bool:
+        return len(self._children) > 0
+
+    def has_parent(self) -> bool:
+        return len(self._parent) > 0
+
+    def add_child_link(self, node: "AbstractNode"):
+        if node not in self._children:
+            self._children.append(node)
+
+    def add_parent_link(self, node: "AbstractNode"):
+        if node not in self._parent:
+            self._parent.append(node)
+
+    def remove_child_link(self, node: "AbstractNode"):
+        """
+        Removes a child node from the children list.
+        """
+        if node in self._children:
+            self._children.remove(node)
+
+    def remove_parent_link(self, node: "AbstractNode"):
+        """
+        Removes a parent node from the parent list.
+        """
+        if node in self._parent:
+            self._parent.remove(node)
+
+
+class BaseStation(AbstractNode):
+    def __init__(
+        self,
+        node_id: int,
+        position: NDArray,
+        basestation_type: BaseStationType,
+        isGeographic: bool = True,
+    ):
+        super().__init__(
+            node_id=node_id,
+            position=position,
+            isGeographic=isGeographic,
+        )
+        self.basestation_type = basestation_type
+        self.connected_user: list[User] = []
+        self.transmission_power_density: float = 0.0
+        self.jamming_power_density: float = 0.0
+        self.throughput: float = 0.0
+
+    @property
+    def config(self) -> BaseStationConfig:
+        return getattr(self, "_config", self.basestation_type.config)
+
+    @config.setter
+    def config(self, value: BaseStationConfig):
+        self._config = value
+
+    def __repr__(self):
+        # return f"BaseStation(node_id={self._node_id}, position={self._position}, type={self.basestation_type})"
+        return f"BS{self._node_id}"
+
+    def compute_throughput(self) -> float:
+        """
+        Compute the throughput of the base station.
+        Implementation of the Equation (??) in the paper.
+        """
+        if not self.has_children():
+            return float("inf")
+        self._set_transmission_and_jamming_power_density()
+        denominator = 1e-8
+        for node in self.get_children():
+            snr = self._compute_snr(node)
+            spectral_efficiency = np.log2(1 + snr)
+            if isinstance(node, User):
+                sum_hops = node.hops
+            elif isinstance(node, BaseStation):
+                sum_hops = sum([user.hops for user in node.connected_user])
+            else:
+                raise ValueError("Unsupported node type.")
+            if spectral_efficiency == 0:
+                print(
+                    f"{self}, {node}, {self.jamming_power_density}, {self.transmission_power_density} : SNR: {snr}, Spectral Efficiency: {spectral_efficiency}"
+                )
+            denominator += sum_hops / spectral_efficiency
+
+        self.throughput = self.basestation_type.config.bandwidth * 1e6 / denominator
+        return self.throughput
+
+    def compute_minimum_secrecy_rate(self, eves: np.ndarray) -> float:
+        """
+        Compute the minimum secrecy rate among this base station's connected users
+        given the eavesdroppers' positions.
+
+        eves: shape [N,3], each row is the (x, y, z) of an eavesdropper.
+
+        The secrecy rate for each user is:
+            R_sec = throughput * [ 1 - (spectral_efficiency / hops) * log2(1 + max_eve_snr) ],
+
+        where:
+        - spectral_efficiency = log2(1 + user_snr),
+        - max_eve_snr is the maximum among all eavesdroppers,
+          computed as:
+               tx_power_linear * np.random.exponential(1)
+               / (noise_linear + jamming_linear) / distance_to_eve.
+
+        Returns the minimum secrecy rate (float) among all connected users.
+        """
+        if not (self.connected_user and self.has_children()):
+            return float("inf")
+
+        throughput = self.compute_throughput()
+
+        # Convert power densities from dB to linear scale
+        tx_power_linear = dB_to_linear(self.transmission_power_density)
+        jamming_power_linear = dB_to_linear(self.jamming_power_density)
+        noise_power_linear = dB_to_linear(environmental_variables.noise_power_density)
+
+        # Compute distances to all eavesdroppers
+        eve_positions = np.array(eves)  # shape: (N_eves, 2)
+        dist_eves = geo_distances(
+            self.get_position(), eve_positions
+        )  # shape: (N_eves,)
+
+        # Sample channel fading from Exponential(1)
+        fading = np.random.exponential(
+            scale=1.0, size=eve_positions.shape[0]
+        )  # shape: (N_eves,)
+
+        # Compute eavesdropper SNRs
+        pathloss_exp = self.basestation_type.config.pathloss_exponent
+        eve_snrs = (
+            tx_power_linear
+            * fading
+            / (noise_power_linear + jamming_power_linear)
+            / np.power(dist_eves, pathloss_exp)
+        )
+
+        # Take the maximum SNR
+        max_eve_snr = np.max(eve_snrs)
+
+        # Calculate secrecy rate for each connected user
+        secrecy_rates = []
+        for node in self.get_children():
+            snr = self._compute_snr(node)
+            spectral_efficiency = np.log2(1 + snr)
+            if isinstance(node, User):
+                hops = node.hops
+            elif isinstance(node, BaseStation):
+                if node.connected_user:
+                    # If the node has connected users, use the minimum hops
+                    hops = min([user.hops for user in node.connected_user])
+                else:
+                    continue
+            else:
+                raise ValueError("Unsupported node type.")
+            secrecy_rate = throughput * (
+                1 - spectral_efficiency / hops * np.log2(1 + max_eve_snr)
+            )
+            secrecy_rates.append(secrecy_rate)
+
+        return min(secrecy_rates)
+
+    def _compute_snr(self, node, in_dB: bool = False) -> float:
+        """
+        Computes SNR (in dB) at a given distance (meters) using a log-distance pathloss model.
+        Assumes that power_capacity in BaseStationConfig is in dBm, carrier_frequency is in GHz,
+        bandwidth is in MHz, antenna gains are in dBi, and pathloss_exponent is dimensionless.
+
+        SNR(dB) = RxPower(dBm) - NoisePower(dBm)
+        RxPower(dBm) = TxPower(dBm) + TxGain(dBi) + RxGain(dBi) - Pathloss(dB)
+        Pathloss(dB) = Pathloss(1m) + 10*alpha*log10(d/1m)
+        NoisePower(dBm) = -174 + 10*log10(BW_Hz)
+        """
+        distance_m = self.get_distance(node) * 1e3
+        config = self.basestation_type.config
+
+        # Physical constants and configuration parameters
+        c = 3.0e8  # speed of light (m/s)
+        freq_ghz = config.carrier_frequency
+        freq_hz = freq_ghz * 1e9
+        wavelength_m = c / freq_hz
+        reference_distance_m = 1.0
+
+        # Calculate path loss at reference distance d0=1m
+        # Pathloss(1m) = 20*log10(4*pi * 1m / lambda)
+        pathloss_1m = 20.0 * np.log10(
+            (4.0 * np.pi * reference_distance_m) / wavelength_m
+        )
+
+        # Calculate path loss at distance d(m) [dB]
+        pathloss_d = pathloss_1m + 10.0 * config.pathloss_exponent * np.log10(
+            distance_m
+        )
+
+        # Transmit power [dBm], transmit/receive antenna gains [dBi]
+        bw_hz = self.basestation_type.config.bandwidth * 1e6
+        tx_power_density_dbm = self.transmission_power_density
+        tx_gain_db = config.transmit_antenna_gain
+        rx_gain_db = config.receive_antenna_gain
+        antenna_gain_to_noise_temperature = config.antenna_gain_to_noise_temperature
+        if (
+            self.basestation_type.name != BaseStationType.LEO.name
+            and isinstance(node, BaseStation)
+            and node.basestation_type.name == BaseStationType.LEO.name
+        ):
+            tx_gain_db = 43.2
+            rx_gain_db = 39.7
+            antenna_gain_to_noise_temperature = 16.2
+
+        # Received power [dBm]
+        rx_power_dbm = tx_power_density_dbm + tx_gain_db + rx_gain_db - pathloss_d
+
+        # Calculate noise power [dBm]
+        # Thermal noise = -174 dBm/Hz
+        noise_power_density_dbm = (
+            environmental_variables.noise_power_density
+            + antenna_gain_to_noise_temperature
+        )
+
+        # SNR [dB]
+        snr_db = rx_power_dbm - noise_power_density_dbm
+
+        return snr_db if in_dB else dB_to_linear(snr_db)
+
+    def _set_transmission_and_jamming_power_density(self):
+        """
+        Compute the transmission and jamming power density.
+        Implmentation of the Equation (??) in the paper.
+        """
+        # Physical constants and configuration parameters
+        config = self.basestation_type.config
+        pathloss_exponent = config.pathloss_exponent
+        power_capacity_density = (
+            dB_to_linear(config.power_capacity) / config.bandwidth / 1e6
+        )  # in mW/Hz
+        noise_power_density = dB_to_linear(environmental_variables.noise_power_density)
+        tau = environmental_variables.SPSC_probability
+        kappa = (
+            np.pi
+            * self.basestation_type.config.eavesdropper_density
+            / np.sin(2 * np.pi / pathloss_exponent)
+        ) ** 0.806 / 0.11  # Curve fitting
+        max_distance = self._get_farthest_forward_link_distance()
+
+        # Equation for threshold
+        if tau != 0:
+            jamming_power_density_mW_over_Hz = (
+                max(
+                    (-(kappa * max_distance**2) / np.log(tau))
+                    ** (pathloss_exponent / 2)
+                    - 1,
+                    0,
+                )
+                * noise_power_density
+                * 3.1623  # 5 dBm offset
+            )
+        else:
+            jamming_power_density_mW_over_Hz = 0
+        jamming_power_density_mW_over_Hz = min(
+            jamming_power_density_mW_over_Hz, power_capacity_density
+        )
+        transmission_power_density_mW_over_Hz = (
+            power_capacity_density - jamming_power_density_mW_over_Hz
+        )
+        self.transmission_power_density = linear_to_dB(
+            transmission_power_density_mW_over_Hz + 1e-16
+        )
+        self.jamming_power_density = linear_to_dB(
+            jamming_power_density_mW_over_Hz + 1e-16
+        )
+
+        return self.transmission_power_density, self.jamming_power_density
+
+    def _get_farthest_forward_link_distance(self):
+        max_distance = 0.0
+        for node in self.get_children():
+            distance = self.get_distance(node)
+            if distance > max_distance:
+                max_distance = distance
+        return max_distance
+
+    def compute_maximum_link_distance(self, is_los: bool = False) -> float:
+        """
+        Compute the maximum link distance.
+        Implementation of the Equation (??) in the paper.
+        """
+        # Physical constants and configuration parameters
+        config = self.config
+        pathloss_exponent = config.pathloss_exponent
+        power_capacity_density = (
+            dB_to_linear(config.power_capacity) / config.bandwidth / 1e6
+        )
+        maximum_jamming_power_density = power_capacity_density * (
+            1 - config.minimum_transit_power_ratio
+        )
+        noise_power_density = dB_to_linear(environmental_variables.noise_power_density)
+
+        tau = environmental_variables.SPSC_probability
+        kappa = (
+            np.pi * config.eavesdropper_density / np.sin(2 * np.pi / pathloss_exponent)
+        ) ** 0.806 / 0.11  # Curve fitting
+        jamming_ratio = (
+            noise_power_density
+            / (maximum_jamming_power_density + noise_power_density)
+            * 3.1623
+        )  # 5 dBm offset
+
+        max_los_distance = (
+            -np.log(tau) / kappa / jamming_ratio ** (2 / pathloss_exponent)
+        ) ** 0.5
+        if is_los:
+            return max_los_distance
+        else:
+            max_distance = min(
+                max_los_distance,
+                self.basestation_type.config.maximum_link_distance,
+            )
+
+            return max_distance
+
+
+class User(AbstractNode):
+    def __init__(self, node_id: int, position: NDArray, isGeographic: bool = True):
+        super().__init__(
+            node_id=node_id,
+            position=position,
+        )
+        self.hops: int = 0
+
+    def __repr__(self):
+        # return f"User(node_id={self._node_id}, position={self._position})"
+        return f"UE{self._node_id}"
+
+
+class IABRelayGraph:
+    def __init__(self, environmental_variables=environmental_variables):
+        self.nodes: dict[int, BaseStation | User] = {}
+        self.users: list[User] = []
+        self.basestations: list[BaseStation] = []
+
+        self.adjacency_list: dict[int, list[int]] = {}
+        self.environmental_variables = environmental_variables
+        self.is_hop_computed = False
+
+    @property
+    def edges(self):
+        edges = []
+        for from_node_id, neighbors in self.adjacency_list.items():
+            for to_node_id in neighbors:
+                edges.append((from_node_id, to_node_id))
+        return edges
+
+    def add_node(self, node: AbstractNode):
+        node_id = node.get_id()
+        if node_id not in self.nodes:
+            self.nodes[node_id] = node
+            self.adjacency_list[node_id] = []
+            if isinstance(node, User):
+                self.users.append(node)
+            elif isinstance(node, BaseStation):
+                self.basestations.append(node)
+            else:
+                raise ValueError("Unsupported node type.")
+
+    def add_edge(self, from_node_id: int, to_node_id: int):
+        # check if the edge already exists
+        if to_node_id in self.adjacency_list[from_node_id]:
+            return
+
+        if from_node_id in self.nodes and to_node_id in self.nodes:
+            self.adjacency_list[from_node_id].append(to_node_id)
+            self.nodes[from_node_id].add_child_link(self.nodes[to_node_id])
+            self.nodes[to_node_id].add_parent_link(self.nodes[from_node_id])
+        else:
+            raise ValueError(
+                f"One or more nodes do not exist in the graph: {from_node_id}, {to_node_id}"
+            )
+
+    def remove_node(self, node_id: int):
+        """
+        Removes a node and all associated edges from the graph.
+        """
+        if node_id not in self.nodes:
+            raise ValueError(f"Node {node_id} does not exist in the graph.")
+
+        # Remove all incoming edges to the node
+        for from_id, neighbors in self.adjacency_list.items():
+            if node_id in neighbors:
+                neighbors.remove(node_id)
+                self.nodes[from_id].remove_child_link(self.nodes[node_id])
+                self.nodes[node_id].remove_parent_link(self.nodes[from_id])
+
+        # Remove all outgoing edges from the node
+        for to_id in self.adjacency_list[node_id]:
+            self.nodes[to_id].remove_parent_link(self.nodes[node_id])
+        del self.adjacency_list[node_id]
+
+        # Remove the node from the nodes dictionary
+        node = self.nodes.pop(node_id)
+
+        # Remove the node from users or basestations list
+        if isinstance(node, User):
+            self.users.remove(node)
+        elif isinstance(node, BaseStation):
+            self.basestations.remove(node)
+        else:
+            raise ValueError("Unsupported node type.")
+
+    def remove_edge(self, from_node_id: int, to_node_id: int):
+        """
+        Removes an edge between two nodes in the graph.
+        """
+        if from_node_id not in self.nodes or to_node_id not in self.nodes:
+            return
+
+        if to_node_id not in self.adjacency_list[from_node_id]:
+            return
+
+        # Remove the edge from the adjacency list
+        self.adjacency_list[from_node_id].remove(to_node_id)
+
+        # Update the parent and child links of the involved nodes
+        self.nodes[from_node_id].remove_child_link(self.nodes[to_node_id])
+        self.nodes[to_node_id].remove_parent_link(self.nodes[from_node_id])
+
+    def reset(self):
+        # Removes all edges in the graph.
+        for node in self.nodes.values():
+            node._children = []
+            node._parent = []
+        self.adjacency_list = {node_id: [] for node_id in self.adjacency_list}
+
+        # Removes all user information
+        for user in self.users:
+            user.hops = 0
+
+    def get_neighbors(self, node_id: int) -> list[int]:
+        return self.adjacency_list.get(node_id, [])
+
+    def compute_hops(self):
+        # reset the hops of users
+        for user in self.users:
+            user.hops = 0
+        for base_station in self.basestations:
+            base_station.connected_user = []
+        #
+        #
+        # if self.is_hop_computed:
+        #     return
+
+        self.is_hop_computed = True
+        for user in self.users:
+            self.compute_hops_for_one_user(user.get_id())
+            # current_node = user
+            # while True:
+            #     assert current_node is not None, f"Current node {current_node} is None."
+            #     if current_node.has_parent():
+            #         user.hops += 1
+            #         parent_nodes: List[AbstractNode] = current_node.get_parent()
+            #         assert (
+            #             len(parent_nodes) == 1
+            #         ), f"There are more than one parent node. Current node: {current_node} Parent node: {parent_nodes}"
+            #         current_node = parent_nodes[0]
+            #         current_node.connected_user.append(user)
+            #     else:
+            #         break
+
+    def compute_hops_for_one_user(self, user_id):
+        # Save the user node
+        user = self.nodes[user_id]
+        current_node = user
+
+        # Keep track of visited nodes
+        visited = set()
+
+        while True:
+            assert current_node is not None, f"Current node {current_node} is None."
+
+            # Check if we have visited this node before
+            if current_node in visited:
+                # Cycle detected
+                user.hops = 1e10  # To prevent the graph is selected.
+                break
+            visited.add(current_node)
+
+            if current_node.has_parent():
+                user.hops += 1
+                parent_nodes: list[AbstractNode] = current_node.get_parent()
+                # Choose the closest parent when multiple are available to keep
+                # hop counting deterministic while supporting multi-parent graphs.
+                parent = min(
+                    parent_nodes,
+                    key=lambda candidate: current_node.get_distance(candidate),
+                )
+                current_node = parent
+                if isinstance(current_node, BaseStation):
+                    current_node.connected_user.append(user)
+            else:
+                break
+
+    def connect_reachable_nodes(
+        self, target_node_id: int | None = None, source_node_id: int = 0
+    ):
+        """
+        Connects all reachable nodes in the graph.
+        """
+        # Connect all reachable nodes in the graph
+        if target_node_id is None:
+            for from_node in self.basestations:
+                from_node_id = from_node.get_id()
+                for to_node_id in self.compute_reachable_nodes(from_node_id):
+                    if from_node_id == to_node_id or to_node_id == source_node_id:
+                        continue
+                    self.add_edge(from_node_id, to_node_id)
+        else:
+            for to_node_id in self.compute_reachable_nodes(target_node_id):
+                if to_node_id == source_node_id:
+                    continue
+                self.add_edge(target_node_id, to_node_id)
+
+        # Remove the direct connection between the source node and the users
+        for node in self.nodes[source_node_id].get_children():
+            if isinstance(node, User):
+                self.adjacency_list[source_node_id].remove(node.get_id())
+
+                # Update the parent and child links of the involved nodes
+                self.nodes[source_node_id].remove_child_link(self.nodes[node.get_id()])
+                self.nodes[node.get_id()].remove_parent_link(self.nodes[source_node_id])
+
+    def compute_reachable_nodes(self, node_id: int):
+        if node_id not in self.nodes:
+            raise ValueError(f"Node {node_id} does not exist in the graph.")
+
+        from_node = self.nodes[node_id]
+        assert isinstance(from_node, BaseStation), (
+            f"Node {node_id} is not a base station."
+        )
+
+        maximum_link_distance = from_node.compute_maximum_link_distance()
+        maximum_link_distance_los = from_node.compute_maximum_link_distance(is_los=True)
+        reachable_nodes = []
+        for to_node in self.nodes.values():
+            # Special case for the source node
+            if node_id == 0 and isinstance(to_node, BaseStation):
+                # Ground stations are wired connected.
+                if (
+                    to_node.basestation_type.name == BaseStationType.GROUND.name
+                    and from_node.get_distance(to_node) <= 300
+                ):
+                    reachable_nodes.append(to_node.get_id())
+                elif (
+                    to_node.basestation_type.name == BaseStationType.MARITIME.name
+                    and from_node.get_distance(to_node) <= maximum_link_distance
+                ):
+                    reachable_nodes.append(to_node.get_id())
+                elif (
+                    to_node.basestation_type.name == BaseStationType.HAPS.name
+                    and from_node.get_distance(to_node) <= 300
+                ):
+                    reachable_nodes.append(to_node.get_id())
+                elif (
+                    to_node.basestation_type.name == BaseStationType.LEO.name
+                    and from_node.get_distance(to_node) <= 700
+                ):
+                    reachable_nodes.append(to_node.get_id())
+                continue
+
+            # Skip the same node
+            if from_node == to_node:
+                continue
+
+            # Add reachable nodes within the maximum link distance
+            if from_node.get_distance(to_node) <= maximum_link_distance:
+                reachable_nodes.append(to_node.get_id())
+
+            # Add a special case for HAPS to LEO connection
+            if (
+                isinstance(to_node, BaseStation)
+                and to_node.basestation_type.name == BaseStationType.LEO.name
+                and from_node.get_distance(to_node)
+                <= min(maximum_link_distance_los, 900)
+            ):
+                reachable_nodes.append(to_node.get_id())
+            elif (
+                isinstance(to_node, BaseStation)
+                and to_node.basestation_type.name == BaseStationType.HAPS.name
+                and from_node.get_distance(to_node)
+                <= min(maximum_link_distance_los, 500)
+            ):
+                reachable_nodes.append(to_node.get_id())
+
+        return reachable_nodes
+
+    def copy(self):
+        """
+        Create a copy of the graph.
+        """
+        return self.copy_graph_with_selected_nodes(list(self.nodes.keys()))
+
+    def copy_graph_with_selected_nodes(self, selected_nodes: list[int]):
+        """
+        Create a new graph with the selected nodes.
+        """
+        new_graph = IABRelayGraph(self.environmental_variables)
+        # add node
+        for node_id in selected_nodes:
+            node = self.nodes[node_id]
+            if isinstance(node, BaseStation):
+                node_copy = BaseStation(
+                    node_id,
+                    node.get_position(),
+                    node.basestation_type,
+                )
+            else:
+                node_copy = User(node_id, node.get_position())
+
+            new_graph.add_node(node_copy)
+
+        # add edge
+        for from_node_id in selected_nodes:
+            for to_node_id in self.get_neighbors(from_node_id):
+                if to_node_id in selected_nodes:
+                    new_graph.add_edge(from_node_id, to_node_id)
+
+        return new_graph
+
+    def compute_network_throughput(self, target_node_list: list[int] | None = None):
+        self.compute_hops()
+        if target_node_list is None:
+            basestation_list = self.basestations[1:]
+        else:
+            basestation_list = [self.nodes[node_id] for node_id in target_node_list]
+
+        throughput_list = []
+        for node in basestation_list:
+            throughput = node.compute_throughput()
+            throughput_list.append(throughput)
+        return min(throughput_list)
+
+    def compute_network_secrecy_rate(
+        self,
+        eves_maritime: np.ndarray,
+        eves_ground: np.ndarray,
+        eves_haps: np.ndarray,
+        eves_leo: np.ndarray,
+    ) -> float:
+        """
+        Iterate through all base stations and compute the minimum secrecy rate.
+        Each base station uses the corresponding eaves array based on its station_type.
+
+        eves_maritime: shape [N_m, 3], each row is (x,y,z) for maritime eaves
+        eves_ground: shape [N_g, 3], each row is (x,y,z) for ground eaves
+        eves_haps: shape [N_h, 3], each row is (x,y,z) for HAPS eaves
+        eves_leo: shape [N_l, 3], each row is (x,y,z) for LEO eaves
+
+        Returns:
+            float: the minimum secrecy rate among all base stations in this graph.
+        """
+        self.compute_hops()
+        secrecy_rate_list = []
+        for node in self.basestations[1:]:
+            if node.basestation_type.name == BaseStationType.MARITIME.name:
+                secrecy_rate = node.compute_minimum_secrecy_rate(eves_maritime)
+            elif node.basestation_type.name == BaseStationType.GROUND.name:
+                secrecy_rate = node.compute_minimum_secrecy_rate(eves_ground)
+            elif node.basestation_type.name == BaseStationType.HAPS.name:
+                secrecy_rate = node.compute_minimum_secrecy_rate(eves_haps)
+            elif node.basestation_type.name == BaseStationType.LEO.name:
+                secrecy_rate = node.compute_minimum_secrecy_rate(eves_leo)
+            else:  # exception
+                raise ValueError(
+                    f"Unsupported base station type: {node.basestation_type.name}"
+                )
+
+            secrecy_rate_list.append(secrecy_rate)
+        return max(min(secrecy_rate_list), 0) if secrecy_rate_list else 0.0
+
+    def save_graph(self, filepath: str, pkl=True):
+        """
+        Save the graph to a file.
+        """
+        if pkl:
+            with open(filepath, "wb") as file:
+                pickle.dump(self, file)
+            return
+
+        # Save the graph as a JSON file
+        data = {
+            "nodes": {
+                node_id: {
+                    "position": node.get_position().tolist(),
+                    "type": node.basestation_type.name
+                    if isinstance(node, BaseStation)
+                    else "User",
+                }
+                for node_id, node in self.nodes.items()
+            },
+            "edges": self.edges,
+        }
+
+        with open(filepath, "w") as file:
+            json.dump(data, file, indent=4)
+
+    def load_graph(self, filepath: str, pkl=True):
+        """
+        Load the graph from a file.
+        """
+        # Check whether the file exists.
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"File {filepath} does not exist.")
+
+        if pkl:
+            with open(filepath, "rb") as file:
+                graph = pickle.load(file)
+                self.__dict__.update(graph.__dict__)
+        else:
+            # Load the graph from a JSON file
+            with open(filepath, "r") as file:
+                data = json.load(file)
+
+            # Create nodes
+            for node_id, node_data in data["nodes"].items():
+                position = np.array(node_data["position"])
+                if node_data["type"] == "User":
+                    node = User(int(node_id), position)
+                else:
+                    node = BaseStation(
+                        int(node_id),
+                        position,
+                        BaseStationType[node_data["type"]],
+                    )
+                self.add_node(node)
+
+            # Create edges
+            for from_node_id, to_node_id in data["edges"]:
+                self.add_edge(from_node_id, to_node_id)
+
+
+    def __repr__(self):
+        num_maritime_nodes = 0
+        num_ground_nodes = 0
+        num_leo_nodes = 0
+        num_haps_nodes = 0
+        num_users = 0
+        for node in self.nodes.values():
+            if isinstance(node, BaseStation):
+                if node.basestation_type == BaseStationType.MARITIME:
+                    num_maritime_nodes += 1
+                elif node.basestation_type == BaseStationType.GROUND:
+                    num_ground_nodes += 1
+                elif node.basestation_type == BaseStationType.LEO:
+                    num_leo_nodes += 1
+                elif node.basestation_type == BaseStationType.HAPS:
+                    num_haps_nodes += 1
+            elif isinstance(node, User):
+                num_users += 1
+
+        # Total number of nodes
+        total_nodes = (
+            num_maritime_nodes + num_ground_nodes + num_leo_nodes + num_haps_nodes
+        )
+
+        # Generate the representation string
+        return (
+            f"<NodeSummary: Total Nodes={total_nodes}, "
+            f"Maritime={num_maritime_nodes}, Ground={num_ground_nodes}, "
+            f"LEO={num_leo_nodes}, HAPS={num_haps_nodes}, Users={num_users}>"
+        )
+
+
+if __name__ == "__main__":
+    graph = IABRelayGraph(environmental_variables)
+    bs0 = BaseStation(0, np.array([0, 0, 0]), BaseStationType.GROUND, False)
+    bs1 = BaseStation(1, np.array([250, 100, 400]), BaseStationType.LEO, False)
+    bs2 = BaseStation(2, np.array([150, 200, 25]), BaseStationType.HAPS, False)
+    bs3 = BaseStation(3, np.array([300, 301, 0]), BaseStationType.MARITIME, False)
+    bs4 = BaseStation(4, np.array([450, 300, 0]), BaseStationType.MARITIME, False)
+    user1 = User(19, np.array([1, 1, 0]))
+    user2 = User(20, np.array([1, 2, 0]))
+    user3 = User(21, np.array([1, 6, 0]))
+    user4 = User(22, np.array([1, 6, 0]))
+    user5 = User(23, np.array([1, 6, 0]))
+    graph.add_node(bs0)
+    graph.add_node(bs1)
+    graph.add_node(bs2)
+    graph.add_node(bs3)
+    graph.add_node(bs4)
+    graph.add_node(user1)
+    graph.add_node(user2)
+    graph.add_node(user3)
+    graph.add_node(user4)
+    graph.add_node(user5)
+    # graph.add_edge(0, 1)
+    # graph.add_edge(0, 2)
+    # graph.add_edge(2, 3)
+    # graph.add_edge(3, 4)
+    # graph.add_edge(1, 19)
+    # graph.add_edge(2, 20)
+    # graph.add_edge(4, 21)
+    # graph.add_edge(4, 22)
+    # graph.add_edge(4, 23)
+
+    # graph.compute_hops()
+    # # print(graph.get_neighbors(1))
+    # t, j = bs0._set_transmission_and_jamming_power_density()
+    # t, j = dB_to_linear(t), dB_to_linear(j)
+    # t, j = (
+    #     t * bs0.basestation_type.config.bandwidth * 1e6,
+    #     j * bs0.basestation_type.config.bandwidth * 1e6,
+    # )
+    # print(f"Transmit power: {t}, jamming power:{j}")
+
+    # print(bs0.compute_throughput())
+    # print(bs0.get_distance(bs1))
+    # print(bs0.compute_maximum_link_distance())
+    # print(graph.compute_reachable_nodes(0))
+
+    for from_node in graph.basestations:
+        print(
+            from_node.basestation_type,
+            from_node.compute_maximum_link_distance(),
+            from_node.compute_maximum_link_distance(True),
+            graph.compute_reachable_nodes(from_node.get_id()),
+        )
+        for to_node in graph.compute_reachable_nodes(from_node.get_id()):
+            graph.add_edge(from_node.get_id(), to_node)
+    print(graph.adjacency_list)
