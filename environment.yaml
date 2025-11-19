@@ -1,4 +1,4 @@
-name: ssir
+name: sagsin
 channels:
   - conda-forge
   - defaults
